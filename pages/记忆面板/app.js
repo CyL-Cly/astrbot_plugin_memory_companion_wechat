@@ -3579,7 +3579,7 @@ defineView("migrate", {
       },
       {
         title: "9. 危险清理",
-        desc: "清空会先备份数据库，再删除记忆、权限规则、时间线、关系、身份与注入日志。",
+        desc: "清空会先备份数据库，再删除正式记忆、时间线、权限规则、关系、身份、注入日志与画像等；捕获若仍开，之后还会重新写入。",
         danger: true,
         actions: [["clearAllBtn", "清空全部记忆"]],
       },
@@ -3642,6 +3642,27 @@ defineView("migrate", {
       if (button) button.addEventListener("click", () => run(label, fn));
     };
 
+    // Confirm must run OUTSIDE withBusy: .busy-layer (z=90) used to cover
+    // .inline-confirm-overlay (was z=60), so "清空记忆" spun forever.
+    const bindConfirm = (id, confirmFn, apiFn, label) => {
+      const button = $(id, node);
+      if (!button) return;
+      button.addEventListener("click", async () => {
+        let confirmed = false;
+        try {
+          confirmed = await confirmFn();
+        } catch (error) {
+          toast(label + "失败：" + (error && error.message ? error.message : error), "error");
+          return;
+        }
+        if (!confirmed) {
+          toast("已取消", "error");
+          return;
+        }
+        await run(label, apiFn);
+      });
+    };
+
     bind("#diagnosticsBtn", () => apiGet("/operations/diagnostics"), "生成诊断");
     bind("#portableExportBtn", () => apiPost("/data/export", {}), "导出数据");
     bind("#portablePreviewBtn", () => {
@@ -3667,26 +3688,34 @@ defineView("migrate", {
       if (!batchId) throw new Error("请先填写批次 ID");
       return apiPost("/maintenance/release_summary_batch", { batch_id: batchId, mode: "retry" });
     }, "释放批次事件");
-    bind("#releaseDiscardBtn", async () => {
-      const batchId = $("#releaseBatchId", node).value.trim();
-      if (!batchId) throw new Error("请先填写批次 ID");
-      const confirmed = await showInlineConfirmation(
+    bindConfirm(
+      "#releaseDiscardBtn",
+      () => showInlineConfirmation(
         "放弃该批次的事件",
         "这些原始消息将被标记为已总结，等于承认它们不会进入长期记忆。确定继续？",
         "放弃"
-      );
-      if (!confirmed) throw new Error("已取消");
-      return apiPost("/maintenance/release_summary_batch", { batch_id: batchId, mode: "discard" });
-    }, "放弃批次事件");
+      ),
+      () => {
+        const batchId = $("#releaseBatchId", node).value.trim();
+        if (!batchId) throw new Error("请先填写批次 ID");
+        return apiPost("/maintenance/release_summary_batch", { batch_id: batchId, mode: "discard" });
+      },
+      "放弃批次事件"
+    );
     bind("#auditPreviewBtn", () => apiPost("/maintenance/audit/preview", { limit: int($("#auditLimit", node).value) }), "生成审计预览");
     bind("#auditStatusBtn", () => apiGet("/maintenance/audit/status?batch_id=" + encodeURIComponent($("#auditBatch", node).value.trim())), "读取审计状态");
     bind("#auditApplyBtn", () => apiPost("/maintenance/audit/apply", { batch_id: $("#auditBatch", node).value.trim(), confirm: "应用" }), "应用审计");
     bind("#auditRollbackBtn", () => apiPost("/maintenance/audit/rollback", { batch_id: $("#auditBatch", node).value.trim(), confirm: "回滚" }), "回滚审计");
-    bind("#clearAllBtn", async () => {
-      const confirmed = await showInlineConfirmation("清空全部记忆", "将清空全部记忆数据（会先备份数据库）。确定继续？", "清空");
-      if (!confirmed) throw new Error("已取消");
-      return apiPost("/maintenance/clear_all", { confirm: "清空" });
-    }, "清空记忆");
+    bindConfirm(
+      "#clearAllBtn",
+      () => showInlineConfirmation(
+        "清空全部记忆",
+        "将清空正式记忆、时间线、注入日志、知识图谱、画像等全部记忆库数据（会先备份数据库）。若群聊/私聊捕获仍开启，清空后新消息仍会重新写入时间线。确定继续？",
+        "清空"
+      ),
+      () => apiPost("/maintenance/clear_all", { confirm: "清空" }),
+      "清空记忆"
+    );
   },
 });
 

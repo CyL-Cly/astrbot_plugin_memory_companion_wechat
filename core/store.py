@@ -3274,13 +3274,25 @@ class MemoryStore(SummaryBatchStore):
                     pass
                 self._read_conn = None
 
-    def backup(self, suffix: str = "") -> Path:
+    def backup(self, suffix: str = "", *, lock_timeout: float | None = None) -> Path:
         stamp = utc_now().replace(":", "").replace("-", "").replace("+", "_")
         target = self.db_path.with_name(f"{self.db_path.stem}.backup.{stamp}{suffix}.db")
-        with self._lock:
+        if lock_timeout is None:
+            with self._lock:
+                self._conn.commit()
+                with closing(sqlite3.connect(str(target))) as target_conn:
+                    self._conn.backup(target_conn)
+            return target
+        if not self._lock.acquire(timeout=float(lock_timeout)):
+            raise TimeoutError(
+                f"记忆库写入锁繁忙，备份未能在 {lock_timeout:g} 秒内开始"
+            )
+        try:
             self._conn.commit()
             with closing(sqlite3.connect(str(target))) as target_conn:
                 self._conn.backup(target_conn)
+        finally:
+            self._lock.release()
         return target
 
     async def backup_async(self, suffix: str = "") -> Path:
@@ -3298,9 +3310,18 @@ class MemoryStore(SummaryBatchStore):
         return await asyncio.to_thread(self._clear_all_memory_data_sync)
 
     def _clear_all_memory_data_sync(self) -> dict[str, Any]:
-        backup = self.backup(".before_clear_all")
+        # Fail fast instead of spinning forever if a cancelled to_thread still
+        # holds the write lock (e.g. summary worker mid-write).
+        backup = self.backup(".before_clear_all", lock_timeout=45.0)
+        # Order: children / join tables before parents where CASCADE is absent.
+        # summary_batch_events CASCADE from summary_batches/timeline; still
+        # delete explicitly so residual counts go to zero even if FK off.
         tables = [
             "memory_fts",
+            "timeline_source_fts",
+            "knowledge_label_trgm",
+            "summary_batch_calls",
+            "summary_batch_events",
             "emotion_event_deliveries",
             "emotion_events",
             "portrait_learning_queue",
@@ -3309,7 +3330,10 @@ class MemoryStore(SummaryBatchStore):
             "portrait_facts",
             "portrait_evidence",
             "portrait_operations",
+            "portrait_scope_capabilities",
             "portrait_people",
+            "profile_repair_operations",
+            "memory_correction_receipts",
             "review_queue",
             "injection_logs",
             "summary_failures",
@@ -3327,21 +3351,30 @@ class MemoryStore(SummaryBatchStore):
             "identities",
             "memories",
             "import_batches",
+            "retrieval_revision",
+            "source_query_revision",
         ]
+        optional_virtual = {"memory_fts", "timeline_source_fts", "knowledge_label_trgm"}
         deleted: dict[str, int] = {}
-        with self._lock:
+        if not self._lock.acquire(timeout=45.0):
+            raise TimeoutError(
+                "记忆库写入锁繁忙，清空未能在 45 秒内开始；请稍后重试"
+            )
+        try:
             with self._transaction_sync():
                 for table in tables:
                     try:
                         cur = self._conn.execute(f"DELETE FROM {table}")
                     except sqlite3.Error:
-                        if table == "memory_fts":
+                        if table in optional_virtual:
                             continue
                         raise
                     deleted[table] = int(cur.rowcount or 0)
             # The policy table was just emptied; the projection has to follow,
             # otherwise window switches would keep answering with deleted rows.
             self.clear_acl_projection_sync()
+        finally:
+            self._lock.release()
         return {"backup": str(backup), "deleted": deleted}
 
     async def preview_scoped_memory_clear(

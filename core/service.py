@@ -8442,6 +8442,22 @@ class MemoryCompanionService:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # Summary workers are also in _background_tasks via _spawn_background, but
+        # aclose cancels them explicitly so clear_all must do the same — otherwise
+        # a worker mid to_thread can keep holding store._lock while backup waits.
+        summary_tasks = [
+            task
+            for task in self._summary_workers.values()
+            if task is not current and not task.done()
+        ]
+        for task in summary_tasks:
+            task.cancel()
+        if summary_tasks:
+            await asyncio.gather(*summary_tasks, return_exceptions=True)
+        self._summary_workers.clear()
+        self._summary_pending.clear()
+        self._summary_pending_contexts.clear()
+        self._summary_pending_reasons.clear()
         self._embedding_backfill_inflight.clear()
         self._embedding_memory_inflight.clear()
         self._embedding_backfill_last_run.clear()

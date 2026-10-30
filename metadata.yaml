@@ -2,7 +2,7 @@ name: astrbot_plugin_memory_companion
 display_name: 我会牢牢记住你（微信 bridge 适配）
 author: menglimi / wechat-bridge fork
 author_url: https://github.com/CyL-Cly/astrbot_plugin_memory_companion_wechat
-version: 2.3.1-wechat.3
+version: 2.3.1-wechat.4
 description: 我会牢牢记住你是面向 AstrBot 陪伴体系的记忆陪伴中枢。本 fork 在上游 2.3.1 基础上兼容 wechat_robot（wechat-robot-client）会话与平台族，保留与 private_companion 的记忆桥接协议。
 desc: 上游记忆陪伴中枢 + wechat_robot 平台兼容（会话 UMO / 平台族 / 管理桶标签）。插件 ID 仍为 astrbot_plugin_memory_companion，以便 Companion 桥接。
 repo: https://github.com/CyL-Cly/astrbot_plugin_memory_companion_wechat
