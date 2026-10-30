@@ -3309,6 +3309,62 @@ class MemoryStore(SummaryBatchStore):
     async def clear_all_memory_data(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._clear_all_memory_data_sync)
 
+    def _drop_all_triggers_sync(self) -> list[str]:
+        """Drop every user trigger so bulk DELETE cannot hit broken FTS/side tables.
+
+        Root cause of clear-all 500s: wiping ``timeline_source_fts`` first leaves
+        ``trg_timeline_source_fts_ad`` (and capture/life/semantic mirrors) trying
+        to sync into a half-deleted FTS/index on the subsequent
+        ``DELETE FROM timeline``, which SQLite reports as
+        ``database disk image is malformed``. Dropping triggers first makes the
+        wipe a plain table clear; ``initialize()`` recreates them afterwards.
+        """
+        rows = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name"
+        ).fetchall()
+        names = [clean_text(row["name"] if hasattr(row, "keys") else row[0], 200) for row in rows]
+        names = [name for name in names if name]
+        for name in names:
+            self._conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+        return names
+
+    def _rebuild_empty_database_sync(self) -> dict[str, Any]:
+        """Nuclear clear: move aside db(+wal/shm) and recreate an empty schema.
+
+        Callers must already hold ``self._lock``. Used when DELETE still fails
+        after dropping triggers (true corruption).
+        """
+        stamp = utc_now().replace(":", "").replace("-", "").replace("+", "_")
+        moved: list[str] = []
+        with self._read_lock:
+            if self._read_conn is not None:
+                try:
+                    self._read_conn.close()
+                except sqlite3.Error:
+                    pass
+                self._read_conn = None
+        try:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+        except sqlite3.Error:
+            pass
+        try:
+            self._conn.close()
+        except sqlite3.Error:
+            pass
+        for suffix in ("", "-wal", "-shm"):
+            src = self.db_path if not suffix else Path(str(self.db_path) + suffix)
+            if not src.is_file():
+                continue
+            dst = src.with_name(f"{src.name}.corrupt.clear_all.{stamp}")
+            src.replace(dst)
+            moved.append(str(dst))
+        self._conn = self._open_connection()
+        # initialize() also takes ``self._lock``; RLock allows re-entry.
+        self.initialize()
+        self.clear_acl_projection_sync()
+        return {"moved": moved, "stamp": stamp}
+
     def _clear_all_memory_data_sync(self) -> dict[str, Any]:
         # Fail fast instead of spinning forever if a cancelled to_thread still
         # holds the write lock (e.g. summary worker mid-write).
@@ -3316,6 +3372,8 @@ class MemoryStore(SummaryBatchStore):
         # Order: children / join tables before parents where CASCADE is absent.
         # summary_batch_events CASCADE from summary_batches/timeline; still
         # delete explicitly so residual counts go to zero even if FK off.
+        # Include capture / life / semantic side tables so "清空" matches what
+        # users see as leftover after deleting only formal memories.
         tables = [
             "memory_fts",
             "timeline_source_fts",
@@ -3343,6 +3401,22 @@ class MemoryStore(SummaryBatchStore):
             "relationship_edges",
             "knowledge_edges",
             "knowledge_nodes",
+            "capture_changes",
+            "capture_suppression",
+            "capture_operations",
+            "capture_chunks",
+            "capture_sources",
+            "capture_runtime",
+            "life_message_withdrawals",
+            "message_source_tombstones",
+            "life_message_source_watches",
+            "life_source_watches",
+            "source_semantic_dirty",
+            "source_semantic_order_changes",
+            "source_semantic_dependencies",
+            "source_semantic_documents",
+            "source_semantic_generations",
+            "source_semantic_revision",
             "timeline",
             "cross_window_threads",
             "memory_acl_rules",
@@ -3354,28 +3428,82 @@ class MemoryStore(SummaryBatchStore):
             "retrieval_revision",
             "source_query_revision",
         ]
-        optional_virtual = {"memory_fts", "timeline_source_fts", "knowledge_label_trgm"}
+        optional_missing = {
+            "memory_fts",
+            "timeline_source_fts",
+            "knowledge_label_trgm",
+            "capture_changes",
+            "capture_suppression",
+            "capture_operations",
+            "capture_chunks",
+            "capture_sources",
+            "capture_runtime",
+            "life_message_withdrawals",
+            "message_source_tombstones",
+            "life_message_source_watches",
+            "life_source_watches",
+            "source_semantic_dirty",
+            "source_semantic_order_changes",
+            "source_semantic_dependencies",
+            "source_semantic_documents",
+            "source_semantic_generations",
+            "source_semantic_revision",
+            "summary_batch_calls",
+            "chat_import_segments",
+            "chat_import_batches",
+            "portrait_scope_capabilities",
+            "profile_repair_operations",
+            "memory_correction_receipts",
+        }
         deleted: dict[str, int] = {}
+        dropped_triggers: list[str] = []
+        rebuild: dict[str, Any] | None = None
         if not self._lock.acquire(timeout=45.0):
             raise TimeoutError(
                 "记忆库写入锁繁忙，清空未能在 45 秒内开始；请稍后重试"
             )
         try:
-            with self._transaction_sync():
-                for table in tables:
-                    try:
-                        cur = self._conn.execute(f"DELETE FROM {table}")
-                    except sqlite3.Error:
-                        if table in optional_virtual:
-                            continue
-                        raise
-                    deleted[table] = int(cur.rowcount or 0)
-            # The policy table was just emptied; the projection has to follow,
-            # otherwise window switches would keep answering with deleted rows.
-            self.clear_acl_projection_sync()
+            try:
+                with self._transaction_sync():
+                    # Disable FK checks so parent/child order cannot strand us.
+                    self._conn.execute("PRAGMA foreign_keys=OFF")
+                    dropped_triggers = self._drop_all_triggers_sync()
+                    for table in tables:
+                        try:
+                            cur = self._conn.execute(f"DELETE FROM {table}")
+                        except sqlite3.Error as error:
+                            message = clean_text(error, 200).lower()
+                            if table in optional_missing and (
+                                "no such table" in message or "no such" in message
+                            ):
+                                continue
+                            raise
+                        deleted[table] = int(cur.rowcount or 0)
+                    self._conn.execute("PRAGMA foreign_keys=ON")
+            except sqlite3.DatabaseError as error:
+                # True corruption / FTS half-state: move the file aside and
+                # recreate an empty schema so the panel button still completes.
+                rebuild = {
+                    "reason": clean_text(error, 500),
+                    **self._rebuild_empty_database_sync(),
+                }
+                deleted = {table: -1 for table in tables}
+            else:
+                # Recreate triggers / IF NOT EXISTS side schema that wipe removed.
+                self.initialize()
+                # The policy table was just emptied; the projection has to follow,
+                # otherwise window switches would keep answering with deleted rows.
+                self.clear_acl_projection_sync()
         finally:
             self._lock.release()
-        return {"backup": str(backup), "deleted": deleted}
+        result: dict[str, Any] = {
+            "backup": str(backup),
+            "deleted": deleted,
+            "dropped_triggers": len(dropped_triggers),
+        }
+        if rebuild is not None:
+            result["rebuilt_empty_database"] = rebuild
+        return result
 
     async def preview_scoped_memory_clear(
         self,
